@@ -1,0 +1,56 @@
+name: alerts
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publication
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+    working-directory: pharmoire
+
+env:
+  DATA_REPOSITORY: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: bruno00o/pharmoire
+          ssh-key: ${{ secrets.PHARMOIRE_DEPLOY_KEY }}
+          path: pharmoire
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: pharmoire/package.json
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pharmoire/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm pipeline:download
+
+      - run: pnpm pipeline:alerts
+
+      - name: Refresh the alerts of the current release
+        run: |
+          gh release download current -R "$DATA_REPOSITORY" --pattern manifest.json --dir data/previous
+          pnpm --silent pipeline:manifest --previous data/previous/manifest.json --alerts data/alerts.db --out data/manifest.json > /dev/null
+          gh release upload current -R "$DATA_REPOSITORY" data/alerts.db data/manifest.json --clobber
+          { echo '```json'; cat data/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,84 @@
+name: publish
+
+on:
+  schedule:
+    - cron: "41 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publication
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+    working-directory: pharmoire
+
+env:
+  DATA_REPOSITORY: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+  KEPT_DATA_RELEASES: "4"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: bruno00o/pharmoire
+          ssh-key: ${{ secrets.PHARMOIRE_DEPLOY_KEY }}
+          path: pharmoire
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: pharmoire/package.json
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pharmoire/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: command -v zstd || sudo apt-get install --yes zstd
+
+      - run: pnpm pipeline:download
+
+      - run: pnpm pipeline:build
+
+      - name: Restore the documents store
+        run: |
+          gh release download documents-store -R "$DATA_REPOSITORY" --pattern documents.db.zst --dir data
+          zstd --decompress --long=27 --rm data/documents.db.zst -o data/documents.db
+
+      - run: pnpm pipeline:notices
+
+      - run: pnpm pipeline:alerts
+
+      - name: Publish the data release
+        run: |
+          release="data-$(date -u +%Y-%m-%d-%H%M)"
+          pnpm --silent pipeline:manifest --data-release "$release" --out data/manifest.json > /dev/null
+          gh release create "$release" -R "$DATA_REPOSITORY" --latest=false \
+            --title "Données du $(date -u +%d/%m/%Y)" \
+            --notes "Base des médicaments et notices officielles, construites depuis la base de données publique des médicaments (ANSM). Pharmoire n'est pas un service de l'ANSM." \
+            data/reference.db data/notices.db
+          if ! gh release view current -R "$DATA_REPOSITORY" > /dev/null 2>&1; then
+            gh release create current -R "$DATA_REPOSITORY" --latest=false --title "Données en cours" \
+              --notes "Manifeste lu par l'app et alertes de l'ANSM du jour."
+          fi
+          gh release upload current -R "$DATA_REPOSITORY" data/alerts.db data/manifest.json --clobber
+          { echo '```json'; cat data/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove old data releases
+        run: |
+          gh release list -R "$DATA_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^data-' | sort -r | tail -n "+$((KEPT_DATA_RELEASES + 1))" \
+            | while read -r tag; do
+                gh release delete "$tag" -R "$DATA_REPOSITORY" --yes --cleanup-tag
+              done

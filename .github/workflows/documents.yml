@@ -1,0 +1,96 @@
+name: documents
+
+on:
+  schedule:
+    - cron: "23 3 * * 2"
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: Durée maximale du parcours, en minutes
+        default: "240"
+      rate:
+        description: Requêtes par seconde vers le site de la BDPM
+        default: "2"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: documents
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+    working-directory: pharmoire
+
+env:
+  STORE_TAG: documents-store
+  STORE_ASSET: documents.db.zst
+  DATA_REPOSITORY: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: bruno00o/pharmoire
+          ssh-key: ${{ secrets.PHARMOIRE_DEPLOY_KEY }}
+          path: pharmoire
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: pharmoire/package.json
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pharmoire/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: command -v zstd || sudo apt-get install --yes zstd
+
+      - run: pnpm pipeline:download
+
+      - run: pnpm pipeline:build
+
+      - name: Restore the documents store
+        run: |
+          if gh release view "$STORE_TAG" -R "$DATA_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep --quiet --line-regexp "$STORE_ASSET"; then
+            gh release download "$STORE_TAG" -R "$DATA_REPOSITORY" --pattern "$STORE_ASSET" --dir data
+            zstd --decompress --long=27 --rm "data/$STORE_ASSET" -o data/documents.db
+            echo "Restored $(du -h data/documents.db | cut -f1) documents store"
+          else
+            echo "No documents store yet, starting from scratch"
+          fi
+
+      - name: Crawl RCP and notices
+        id: crawl
+        env:
+          MAX_MINUTES: ${{ inputs.max_minutes || '240' }}
+          RATE: ${{ inputs.rate || '2' }}
+        run: pnpm --silent pipeline:documents --rate "$RATE" --max-minutes "$MAX_MINUTES" | tee crawl-report.json
+
+      - name: Save the documents store
+        if: ${{ always() && (steps.crawl.outcome == 'success' || steps.crawl.outcome == 'failure') }}
+        run: |
+          node --input-type=module -e "import { DatabaseSync } from 'node:sqlite'; new DatabaseSync('data/documents.db').close();"
+          zstd -15 --long=27 -T0 --force data/documents.db -o "data/$STORE_ASSET"
+          if ! gh release view "$STORE_TAG" -R "$DATA_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$STORE_TAG" -R "$DATA_REPOSITORY" --title "Base de travail du parcours" --latest=false \
+              --notes "RCP et notices extraits du site de la base de données publique des médicaments. Ce fichier sert au pipeline et n'est pas destiné à l'app."
+          fi
+          gh release upload "$STORE_TAG" -R "$DATA_REPOSITORY" "data/$STORE_ASSET" --clobber
+          echo "Saved $(du -h "data/$STORE_ASSET" | cut -f1) compressed documents store"
+
+      - name: Summary
+        if: ${{ always() }}
+        run: |
+          if [ -s crawl-report.json ]; then
+            { echo '```json'; cat crawl-report.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
