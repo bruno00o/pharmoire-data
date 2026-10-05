@@ -21,6 +21,7 @@ env:
   DATA_REPOSITORY: ${{ github.repository }}
   GH_TOKEN: ${{ github.token }}
   KEPT_DATA_RELEASES: "4"
+  RELEASE_OF_URL: 's|^https://github\.com/[^/]*/[^/]*/releases/download/\([^/]*\)/[^/]*$|\1|p'
 
 jobs:
   publish:
@@ -60,25 +61,71 @@ jobs:
 
       - run: pnpm pipeline:alerts
 
+      - name: Fetch the notices in use
+        run: |
+          mkdir -p data/previous
+          if ! gh release download current -R "$DATA_REPOSITORY" --pattern manifest.json --dir data/previous; then
+            echo "::notice::No current manifest, the notices will be published as a new base."
+            exit 0
+          fi
+          base_release="$(jq -r '.notices.url' data/previous/manifest.json | sed -n "$RELEASE_OF_URL")"
+          if [ -z "$base_release" ] \
+            || ! gh release download "$base_release" -R "$DATA_REPOSITORY" --pattern notices.db --dir data/previous; then
+            echo "::warning::The notices base in use cannot be downloaded, the notices will be published as a new base."
+            rm -f data/previous/notices.db
+            exit 0
+          fi
+          delta_url="$(jq -r '.noticesDelta.url // empty' data/previous/manifest.json)"
+          if [ -z "$delta_url" ]; then
+            exit 0
+          fi
+          delta_release="$(echo "$delta_url" | sed -n "$RELEASE_OF_URL")"
+          if [ -z "$delta_release" ] \
+            || ! gh release download "$delta_release" -R "$DATA_REPOSITORY" --pattern notices-delta.db --dir data/previous; then
+            echo "::warning::The notices delta in use cannot be downloaded, the notices will be published as a new base."
+            rm -f data/previous/notices-delta.db
+          fi
+
       - name: Publish the data release
         run: |
           release="data-$(date -u +%Y-%m-%d-%H%M)"
-          pnpm --silent pipeline:manifest --data-release "$release" --out data/manifest.json > /dev/null
+          pnpm --silent pipeline:manifest --data-release "$release" \
+            --base-manifest data/previous/manifest.json \
+            --base-notices data/previous/notices.db \
+            --base-delta data/previous/notices-delta.db \
+            --notices-delta data/notices-delta.db \
+            --out data/manifest.json > /dev/null
+          if jq -e '.noticesDelta' data/manifest.json > /dev/null; then
+            notices_file=data/notices-delta.db
+            notices_label="mise à jour des notices officielles de la release $(jq -r '.notices.url' data/manifest.json | sed -n "$RELEASE_OF_URL")"
+          else
+            notices_file=data/notices.db
+            notices_label="notices officielles"
+          fi
           gh release create "$release" -R "$DATA_REPOSITORY" --latest=false \
             --title "Données du $(date -u +%d/%m/%Y)" \
-            --notes "Base des médicaments et notices officielles, construites depuis la base de données publique des médicaments (ANSM). Pharmoire n'est pas un service de l'ANSM." \
-            data/reference.db data/notices.db
+            --notes "Base des médicaments et $notices_label, construites depuis la base de données publique des médicaments (ANSM). Pharmoire n'est pas un service de l'ANSM." \
+            data/reference.db "$notices_file"
           if ! gh release view current -R "$DATA_REPOSITORY" > /dev/null 2>&1; then
             gh release create current -R "$DATA_REPOSITORY" --latest=false --title "Données en cours" \
               --notes "Manifeste lu par l'app et alertes de l'ANSM du jour."
           fi
           gh release upload current -R "$DATA_REPOSITORY" data/alerts.db data/manifest.json --clobber
-          { echo '```json'; cat data/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "Notices publiées : \`$(basename "$notices_file")\`"; echo; echo '```json'; cat data/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove old data releases
         run: |
+          base_release="$(jq -r '.notices.url' data/manifest.json | sed -n "$RELEASE_OF_URL")"
+          if [ -z "$base_release" ]; then
+            echo "::error::The release of the notices base cannot be read from the manifest."
+            exit 1
+          fi
           gh release list -R "$DATA_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' \
             | grep '^data-' | sort -r | tail -n "+$((KEPT_DATA_RELEASES + 1))" \
             | while read -r tag; do
+                if [ "$tag" = "$base_release" ]; then
+                  echo "Keeping $tag, which holds the notices base in use"
+                  continue
+                fi
                 gh release delete "$tag" -R "$DATA_REPOSITORY" --yes --cleanup-tag
               done
