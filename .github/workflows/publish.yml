@@ -59,7 +59,10 @@ jobs:
 
       - run: pnpm pipeline:notices
 
-      - run: pnpm pipeline:alerts
+      - name: Build the alerts, reusing the recalls of the current release
+        run: |
+          gh release download current -R "$DATA_REPOSITORY" --pattern alerts.db --dir data/previous-alerts || true
+          pnpm pipeline:alerts --previous data/previous-alerts/alerts.db
 
       - name: Fetch the notices in use
         run: |
